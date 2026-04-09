@@ -1,0 +1,5 @@
+cdn-edge
+cdn-controlplane
+cp-data/
+*.exe
+.claude/

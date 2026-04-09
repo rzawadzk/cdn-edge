@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDN Control Plane</title>
+<style>
+  :root { --bg: #0f1117; --card: #1a1d27; --border: #2a2d3a; --text: #e1e4ed; --muted: #8b8fa3; --accent: #6c63ff; --accent-hover: #5a52e0; --green: #22c55e; --red: #ef4444; --yellow: #f59e0b; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.15rem; margin-bottom: 1rem; color: var(--muted); }
+  h3 { font-size: 1rem; margin-bottom: 0.5rem; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+  .header .key-input { display: flex; gap: 0.5rem; }
+  input, select { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.875rem; }
+  input:focus { outline: none; border-color: var(--accent); }
+  button { background: var(--accent); color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
+  button:hover { background: var(--accent-hover); }
+  button.danger { background: var(--red); }
+  button.secondary { background: var(--border); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+  .stat { text-align: center; }
+  .stat .value { font-size: 2rem; font-weight: 700; color: var(--accent); }
+  .stat .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .badge.active { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge.inactive { background: rgba(239,68,68,0.15); color: var(--red); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+  th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 0.75rem; }
+  .tabs { display: flex; gap: 0; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+  .tab { padding: 0.75rem 1.5rem; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .form-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  .form-row input { flex: 1; min-width: 200px; }
+  #toast { position: fixed; bottom: 2rem; right: 2rem; background: var(--green); color: #fff; padding: 0.75rem 1.5rem; border-radius: 8px; display: none; z-index: 999; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div><h1>CDN Control Plane</h1><h2>Manage domains, cache rules, and edge servers</h2></div>
+    <div class="key-input">
+      <input type="password" id="apiKey" placeholder="Admin API Key" style="width:250px">
+      <button onclick="loadAll()">Connect</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('overview')">Overview</div>
+    <div class="tab" onclick="showTab('tenants')">Tenants</div>
+    <div class="tab" onclick="showTab('domains')">Domains</div>
+    <div class="tab" onclick="showTab('edges')">Edges</div>
+    <div class="tab" onclick="showTab('analytics')">Analytics</div>
+  </div>
+
+  <!-- Overview -->
+  <div id="tab-overview">
+    <div class="grid" id="overview-stats"></div>
+  </div>
+
+  <!-- Tenants -->
+  <div id="tab-tenants" class="hidden">
+    <div class="card" style="margin-bottom:1rem">
+      <h3>Create Tenant</h3>
+      <div class="form-row">
+        <input id="newTenantName" placeholder="Tenant name">
+        <button onclick="createTenant()">Create</button>
+      </div>
+    </div>
+    <div class="card"><table><thead><tr><th>Name</th><th>API Key</th><th>Status</th><th>Actions</th></tr></thead><tbody id="tenants-table"></tbody></table></div>
+  </div>
+
+  <!-- Domains -->
+  <div id="tab-domains" class="hidden">
+    <div class="card" style="margin-bottom:1rem">
+      <h3>Add Domain</h3>
+      <div class="form-row">
+        <input id="newDomainHost" placeholder="hostname (e.g. www.example.com)">
+        <input id="newDomainOrigin" placeholder="origin URL (e.g. https://origin.example.com)">
+        <select id="newDomainTenant"></select>
+        <button onclick="createDomain()">Add</button>
+      </div>
+    </div>
+    <div class="card"><table><thead><tr><th>Hostname</th><th>Origin</th><th>TTL</th><th>TLS</th><th>Status</th><th>Actions</th></tr></thead><tbody id="domains-table"></tbody></table></div>
+  </div>
+
+  <!-- Edges -->
+  <div id="tab-edges" class="hidden">
+    <div class="card" style="margin-bottom:1rem">
+      <h3>Register Edge</h3>
+      <div class="form-row">
+        <input id="newEdgeName" placeholder="name (e.g. edge-fra-01)">
+        <input id="newEdgeAddr" placeholder="address (e.g. https://edge-fra:9090)">
+        <input id="newEdgeRegion" placeholder="region (e.g. eu-west)">
+        <button onclick="createEdge()">Register</button>
+      </div>
+    </div>
+    <div class="card"><table><thead><tr><th>Name</th><th>Address</th><th>Region</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody id="edges-table"></tbody></table></div>
+  </div>
+
+  <!-- Analytics -->
+  <div id="tab-analytics" class="hidden">
+    <div class="card">
+      <h3>Domain Analytics</h3>
+      <table><thead><tr><th>Domain</th><th>Requests</th><th>Bytes</th><th>Hit Rate</th><th>Avg Latency</th><th>2xx</th><th>4xx</th><th>5xx</th></tr></thead><tbody id="analytics-table"></tbody></table>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<script>
+const API = '';
+let key = () => document.getElementById('apiKey').value;
+let headers = () => ({'Content-Type':'application/json','X-API-Key':key()});
+
+async function api(method, path, body) {
+  const opts = {method, headers: headers()};
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(API + path, opts);
+  return r.json();
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+function showTab(name) {
+  document.querySelectorAll('[id^="tab-"]').forEach(el => el.classList.add('hidden'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  event.target.classList.add('active');
+}
+
+async function loadAll() {
+  const [tenants, domains, edges, analytics] = await Promise.all([
+    api('GET', '/api/v1/tenants'),
+    api('GET', '/api/v1/domains'),
+    api('GET', '/api/v1/edges'),
+    api('GET', '/api/v1/analytics/query').catch(() => []),
+  ]);
+  renderOverview(tenants, domains, edges);
+  renderTenants(tenants || []);
+  renderDomains(domains || [], tenants || []);
+  renderEdges(edges || []);
+  renderAnalytics(analytics || []);
+}
+
+function renderOverview(tenants, domains, edges) {
+  const t = (tenants||[]).length, d = (domains||[]).length, e = (edges||[]).length;
+  document.getElementById('overview-stats').innerHTML = `
+    <div class="card stat"><div class="value">${t}</div><div class="label">Tenants</div></div>
+    <div class="card stat"><div class="value">${d}</div><div class="label">Domains</div></div>
+    <div class="card stat"><div class="value">${e}</div><div class="label">Edge Nodes</div></div>
+    <div class="card stat"><button onclick="purgeAll()" class="danger" style="font-size:1rem;padding:0.75rem 2rem">Purge All Caches</button><div class="label" style="margin-top:0.5rem">Fan out to all edges</div></div>`;
+}
+
+function renderTenants(tenants) {
+  const tb = document.getElementById('tenants-table');
+  tb.innerHTML = tenants.map(t => `<tr>
+    <td>${t.name}</td>
+    <td><code style="font-size:0.75rem">${t.api_key||''}</code></td>
+    <td><span class="badge ${t.active?'active':'inactive'}">${t.active?'Active':'Inactive'}</span></td>
+    <td><button class="danger" onclick="deleteTenant('${t.id}')">Delete</button></td>
+  </tr>`).join('');
+  // Update tenant select for domains.
+  const sel = document.getElementById('newDomainTenant');
+  sel.innerHTML = tenants.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
+}
+
+function renderDomains(domains, tenants) {
+  const tm = Object.fromEntries((tenants||[]).map(t => [t.id, t.name]));
+  const tb = document.getElementById('domains-table');
+  tb.innerHTML = domains.map(d => `<tr>
+    <td><strong>${d.hostname}</strong><br><span style="color:var(--muted);font-size:0.75rem">${tm[d.tenant_id]||d.tenant_id}</span></td>
+    <td><code style="font-size:0.75rem">${d.origin_url}</code></td>
+    <td>${d.default_ttl_sec}s</td>
+    <td>${d.tls_mode||'managed'}</td>
+    <td><span class="badge ${d.active?'active':'inactive'}">${d.active?'Active':'Inactive'}</span></td>
+    <td><button class="danger" onclick="deleteDomain('${d.id}')">Delete</button></td>
+  </tr>`).join('');
+}
+
+function renderEdges(edges) {
+  const tb = document.getElementById('edges-table');
+  tb.innerHTML = edges.map(e => `<tr>
+    <td>${e.name}</td><td><code style="font-size:0.75rem">${e.addr}</code></td>
+    <td>${e.region}</td><td>${new Date(e.last_seen).toLocaleString()}</td>
+    <td><button class="danger" onclick="deleteEdge('${e.id}')">Remove</button></td>
+  </tr>`).join('');
+}
+
+function renderAnalytics(stats) {
+  const tb = document.getElementById('analytics-table');
+  if (!stats || !stats.length) { tb.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">No data yet</td></tr>'; return; }
+  tb.innerHTML = stats.map(s => {
+    const total = (s.cache_hits||0) + (s.cache_misses||0);
+    const hitRate = total > 0 ? ((s.cache_hits/total)*100).toFixed(1) : '0.0';
+    const bytes = s.bytes_served > 1048576 ? (s.bytes_served/1048576).toFixed(1)+'MB' : (s.bytes_served/1024).toFixed(1)+'KB';
+    return `<tr><td>${s.hostname}</td><td>${s.requests}</td><td>${bytes}</td><td>${hitRate}%</td><td>${(s.avg_latency_ms||0).toFixed(1)}ms</td><td>${s.status_2xx||0}</td><td>${s.status_4xx||0}</td><td>${s.status_5xx||0}</td></tr>`;
+  }).join('');
+}
+
+async function createTenant() {
+  const name = document.getElementById('newTenantName').value;
+  if (!name) return;
+  await api('POST', '/api/v1/tenants', {name});
+  document.getElementById('newTenantName').value = '';
+  toast('Tenant created'); loadAll();
+}
+async function deleteTenant(id) { if(confirm('Delete tenant?')){await api('DELETE','/api/v1/tenants/'+id);toast('Deleted');loadAll();}}
+async function createDomain() {
+  const hostname = document.getElementById('newDomainHost').value;
+  const origin_url = document.getElementById('newDomainOrigin').value;
+  const tenant_id = document.getElementById('newDomainTenant').value;
+  if (!hostname||!origin_url||!tenant_id) return;
+  await api('POST', '/api/v1/domains', {hostname,origin_url,tenant_id,respect_origin_headers:true});
+  document.getElementById('newDomainHost').value='';document.getElementById('newDomainOrigin').value='';
+  toast('Domain added'); loadAll();
+}
+async function deleteDomain(id) { if(confirm('Delete domain?')){await api('DELETE','/api/v1/domains/'+id);toast('Deleted');loadAll();}}
+async function createEdge() {
+  const name=document.getElementById('newEdgeName').value, addr=document.getElementById('newEdgeAddr').value, region=document.getElementById('newEdgeRegion').value;
+  if (!name||!addr) return;
+  await api('POST', '/api/v1/edges', {name,addr,region});
+  document.getElementById('newEdgeName').value='';document.getElementById('newEdgeAddr').value='';document.getElementById('newEdgeRegion').value='';
+  toast('Edge registered'); loadAll();
+}
+async function deleteEdge(id) { if(confirm('Remove edge?')){await api('DELETE','/api/v1/edges/'+id);toast('Removed');loadAll();}}
+async function purgeAll() { if(confirm('Purge all edge caches?')){await api('POST','/api/v1/purge',{});toast('Purge sent');}}
+</script>
+</body>
+</html>

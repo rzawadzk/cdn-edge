@@ -1,0 +1,10 @@
+.git
+.github
+*.md
+cdn-edge
+*.test
+*.out
+.DS_Store
+Dockerfile
+.dockerignore
+deploy/
