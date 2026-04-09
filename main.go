@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,8 @@ import (
 	"github.com/rzawadzk/cdn-edge/proxy"
 	"github.com/rzawadzk/cdn-edge/purge"
 	"github.com/rzawadzk/cdn-edge/ratelimit"
+	"github.com/rzawadzk/cdn-edge/tracing"
+	"github.com/rzawadzk/cdn-edge/upgrade"
 )
 
 func main() {
@@ -31,6 +34,22 @@ func main() {
 
 	logger := logging.New()
 	logger.SetLevel(cfg.LogLevel)
+
+	// Initialize distributed tracing.
+	var tracingShutdown func(context.Context) error
+	if cfg.TracingEnabled {
+		shutdown, err := tracing.Init("cdn-edge", tracing.Config{
+			Enabled:    true,
+			Endpoint:   cfg.TracingEndpoint,
+			SampleRate: cfg.TracingSampleRate,
+			Insecure:   cfg.TracingInsecure,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize tracing: %v", err)
+		}
+		tracingShutdown = shutdown
+		logger.Info("OpenTelemetry tracing enabled, endpoint: " + cfg.TracingEndpoint)
+	}
 
 	// Initialize cache.
 	c, err := cache.NewWithOptions(cache.Options{
@@ -89,6 +108,11 @@ func main() {
 		appHandler = rl.Middleware(appHandler)
 	}
 
+	// Distributed tracing middleware (captures per-request spans).
+	if cfg.TracingEnabled {
+		appHandler = tracing.Middleware(appHandler)
+	}
+
 	// Request latency + status code metrics (wraps entire data plane).
 	appHandler = metrics.NewRequestMetricsMiddleware(met.ReqMet, appHandler)
 
@@ -102,9 +126,15 @@ func main() {
 	// Outermost middleware: structured access logging.
 	mainHandler := logger.Middleware(mainMux)
 
+	// Create listener with SO_REUSEPORT for graceful upgrades.
+	// If CDN_UPGRADE_FD is set, inherits the fd from the parent process.
+	ln, err := upgrade.Listener(cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("failed to create listener: %v", err)
+	}
+
 	// Main server.
 	srv := &http.Server{
-		Addr:         cfg.ListenAddr,
 		Handler:      mainHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -162,6 +192,9 @@ func main() {
 		go poller.Start(pollerCtx, cfg.ConfigPollInterval)
 	}
 
+	// Graceful binary upgrade: set up SIGUSR2 handler.
+	upgrader := upgrade.New(ln)
+
 	// Signal handling: SIGTERM/SIGINT = shutdown, SIGHUP = config reload.
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
@@ -195,16 +228,25 @@ func main() {
 			logger.Info("CDN edge server listening on " + cfg.ListenAddr + ", origin: " + cfg.OriginURL)
 		}
 		met.SetReady(true)
-		var err error
+
+		var serveLn net.Listener = ln
 		if cfg.TLSEnabled && !cfg.TLSAuto {
-			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
-		} else {
-			err = srv.ListenAndServe()
+			tlsLn := tls.NewListener(ln, srv.TLSConfig)
+			serveLn = tlsLn
 		}
-		if err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(serveLn); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
+
+	// If we are an upgraded child process, signal the parent we are ready.
+	if upgrade.IsUpgrade() {
+		if err := upgrade.SignalReady(); err != nil {
+			logger.Error("failed to signal readiness to parent", err)
+		} else {
+			logger.Info("signaled readiness to parent process")
+		}
+	}
 
 	// SIGHUP handler for config reload (reloads log level, rate limits, peers).
 	go func() {
@@ -222,8 +264,24 @@ func main() {
 		}
 	}()
 
+	// Listen for SIGUSR2 (graceful binary upgrade) in background.
+	upgradeCtx, upgradeCancel := context.WithCancel(context.Background())
+	defer upgradeCancel()
+	go func() {
+		if err := upgrader.ListenForUpgrade(upgradeCtx); err != nil {
+			if err != context.Canceled {
+				logger.Error("upgrade listener error", err)
+			}
+			return
+		}
+		// Child is ready — begin graceful shutdown of this (old) process.
+		logger.Info("new process is ready, shutting down old process")
+		done <- syscall.SIGTERM
+	}()
+
 	<-done
 	logger.Info("shutting down...")
+	upgradeCancel()
 
 	// Stop config poller if running.
 	if pollerCancel != nil {
@@ -251,6 +309,14 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("shutdown error: %v", err)
 	}
+
+	// Flush remaining traces.
+	if tracingShutdown != nil {
+		if err := tracingShutdown(ctx); err != nil {
+			logger.Error("tracing shutdown error", err)
+		}
+	}
+
 	logger.Info("server stopped")
 }
 

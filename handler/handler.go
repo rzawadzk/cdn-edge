@@ -19,15 +19,16 @@ import (
 
 // CDN is the main HTTP handler that serves cached content or fetches from origin.
 type CDN struct {
-	cache  *cache.Cache
-	origin *proxy.Origin
-	cfg    *config.Config
-	log    *logging.Logger
+	cache    *cache.Cache
+	origin   *proxy.Origin
+	cfg      *config.Config
+	log      *logging.Logger
+	stampede *cache.StampedeLock
 }
 
 // New creates a CDN handler.
 func New(c *cache.Cache, o *proxy.Origin, cfg *config.Config, log *logging.Logger) *CDN {
-	return &CDN{cache: c, origin: o, cfg: cfg, log: log}
+	return &CDN{cache: c, origin: o, cfg: cfg, log: log, stampede: cache.NewStampedeLock()}
 }
 
 func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +123,32 @@ func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CDN) fetchAndServe(w http.ResponseWriter, r *http.Request, primaryKey string) {
+	// Stampede lock: if another goroutine is already fetching this key, wait
+	// for its result instead of hitting origin again.
+	if entry, waited := h.stampede.Acquire(primaryKey); waited {
+		if entry != nil {
+			serveEntry(w, entry, "HIT")
+		} else {
+			// Fetch failed in the other goroutine; serve stale or 502.
+			if stale := h.cache.Get(primaryKey); stale != nil {
+				serveEntry(w, stale, "STALE-ERROR")
+			} else {
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			}
+		}
+		return
+	}
+	// We are the fetcher — perform the origin request and release the lock.
+	defer func() {
+		// Release is called with the cached entry (or nil on failure) so
+		// waiting goroutines can use it.
+		if entry := h.cache.Get(primaryKey); entry != nil {
+			h.stampede.Release(primaryKey, entry, nil)
+		} else {
+			h.stampede.Release(primaryKey, nil, fmt.Errorf("not cached"))
+		}
+	}()
+
 	originURL := h.cfg.OriginURL + r.URL.RequestURI()
 
 	resp, err := h.origin.Fetch(r.Context(), primaryKey, originURL, r.Header)

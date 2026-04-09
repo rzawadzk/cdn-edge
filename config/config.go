@@ -78,8 +78,14 @@ type Config struct {
 	MaxCacheKeyLen int // max cache key length; 0 = no limit
 
 	// Multi-tenant mode
-	ControlPlaneURL  string        // control plane URL; empty = single-tenant mode
+	ControlPlaneURL    string        // control plane URL; empty = single-tenant mode
 	ConfigPollInterval time.Duration // how often to poll for config updates
+
+	// Tracing (OpenTelemetry)
+	TracingEnabled    bool    // enable distributed tracing
+	TracingEndpoint   string  // OTLP collector gRPC endpoint
+	TracingSampleRate float64 // trace sample rate 0.0-1.0
+	TracingInsecure   bool    // use insecure gRPC connection
 }
 
 // Load parses config from flags, then overlays environment variables.
@@ -141,6 +147,12 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.ControlPlaneURL, "control-plane", "", "control plane URL (enables multi-tenant mode)")
 	flag.DurationVar(&cfg.ConfigPollInterval, "config-poll-interval", 30*time.Second, "config poll interval in multi-tenant mode")
 
+	// Tracing
+	flag.BoolVar(&cfg.TracingEnabled, "tracing", false, "enable OpenTelemetry distributed tracing")
+	flag.StringVar(&cfg.TracingEndpoint, "tracing-endpoint", "localhost:4317", "OTLP collector gRPC endpoint")
+	flag.Float64Var(&cfg.TracingSampleRate, "tracing-sample-rate", 1.0, "trace sample rate (0.0-1.0)")
+	flag.BoolVar(&cfg.TracingInsecure, "tracing-insecure", true, "use insecure gRPC for OTLP")
+
 	flag.Parse()
 
 	// Overlay environment variables (env takes precedence over flags).
@@ -189,6 +201,11 @@ func (cfg *Config) applyEnv() {
 	envInt(&cfg.MaxCacheKeyLen, "CDN_MAX_CACHE_KEY_LEN")
 	envStr(&cfg.ControlPlaneURL, "CDN_CONTROL_PLANE")
 	envDuration(&cfg.ConfigPollInterval, "CDN_CONFIG_POLL_INTERVAL")
+
+	envBool(&cfg.TracingEnabled, "CDN_TRACING")
+	envStr(&cfg.TracingEndpoint, "CDN_TRACING_ENDPOINT")
+	envFloat64(&cfg.TracingSampleRate, "CDN_TRACING_SAMPLE_RATE")
+	envBool(&cfg.TracingInsecure, "CDN_TRACING_INSECURE")
 }
 
 func (cfg *Config) validate() error {
