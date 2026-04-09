@@ -105,9 +105,9 @@ func (h *MultiTenantCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Byte-range passthrough.
-	if r.Header.Get("Range") != "" {
-		h.mtProxyPassthrough(w, r, domain)
+	// Byte-range requests: serve from cache or fetch full + cache + slice.
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		h.mtServeByteRange(w, r, domain, rangeHeader)
 		return
 	}
 
@@ -240,6 +240,76 @@ func (h *MultiTenantCDN) mtDetermineTTL(resp *proxy.Response, domain *tenant.Dom
 		return time.Duration(domain.DefaultTTLSec) * time.Second, swr
 	}
 	return h.defaultTTL, swr
+}
+
+func (h *MultiTenantCDN) mtServeByteRange(w http.ResponseWriter, r *http.Request, domain *tenant.Domain, rangeHeader string) {
+	hostname := stripPort(r.Host)
+	primaryKey := cache.NormalizeKey(hostname, r.URL.Path, r.URL.RawQuery, "", nil)
+
+	// Try to serve from existing cache entry.
+	if entry := h.cache.Get(primaryKey); entry != nil {
+		start, end, ok := parseRange(rangeHeader, len(entry.Body))
+		if !ok {
+			h.mtProxyPassthrough(w, r, domain)
+			return
+		}
+		serveRange(w, entry, start, end)
+		return
+	}
+
+	// Not cached: fetch full response from origin (strip Range so we get complete body).
+	originURL := strings.TrimRight(domain.OriginURL, "/") + r.URL.RequestURI()
+	cleanHeader := r.Header.Clone()
+	cleanHeader.Del("Range")
+	if domain.OriginHost != "" {
+		cleanHeader.Set("Host", domain.OriginHost)
+	}
+
+	resp, err := h.origin.Fetch(r.Context(), primaryKey, originURL, cleanHeader)
+	if err != nil {
+		reqID := logging.GetRequestID(r.Context())
+		h.log.Error("origin fetch failed for "+domain.Hostname, err, reqID)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	rules := h.lookupRules(domain.ID)
+	ttl, swr := h.mtDetermineTTL(resp, domain, rules, r.URL.Path)
+
+	if ttl > 0 && isCacheableStatus(resp.StatusCode) {
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			hash := sha256.Sum256(resp.Body)
+			etag = fmt.Sprintf(`"%x"`, hash[:8])
+		}
+		vary := resp.Header.Get("Vary")
+		cacheKey := cache.NormalizeKey(hostname, r.URL.Path, r.URL.RawQuery, vary, r.Header)
+		entry := &cache.Entry{
+			Body:                 resp.Body,
+			Header:               resp.Header.Clone(),
+			StatusCode:           resp.StatusCode,
+			StoredAt:             time.Now(),
+			TTL:                  ttl,
+			ETag:                 etag,
+			LastMod:              resp.Header.Get("Last-Modified"),
+			VaryKey:              cacheKey,
+			StaleWhileRevalidate: swr,
+		}
+		h.cache.Put(primaryKey, entry)
+		if cacheKey != primaryKey {
+			h.cache.Put(cacheKey, entry)
+		}
+
+		start, end, ok := parseRange(rangeHeader, len(entry.Body))
+		if !ok {
+			serveEntry(w, entry, "MISS")
+			return
+		}
+		serveRange(w, entry, start, end)
+		return
+	}
+
+	serveResponse(w, resp, "BYPASS")
 }
 
 func (h *MultiTenantCDN) mtProxyPassthrough(w http.ResponseWriter, r *http.Request, domain *tenant.Domain) {

@@ -4,6 +4,7 @@
 package certs
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -19,6 +20,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // CertInfo holds metadata about a stored certificate.
@@ -31,25 +35,69 @@ type CertInfo struct {
 	Source    string    `json:"source"` // "acme", "custom", "self-signed"
 }
 
+// ManagerConfig holds configuration for the certificate Manager.
+type ManagerConfig struct {
+	// DataDir is the base directory for storing certificates and metadata.
+	DataDir string
+
+	// ACMEEmail is the contact email for the ACME account (e.g. admin@example.com).
+	ACMEEmail string
+
+	// ACMEDirectory is the ACME directory URL. Defaults to Let's Encrypt production.
+	ACMEDirectory string
+
+	// SelfSignedOnly disables real ACME and always falls back to self-signed certs.
+	// Useful for development/testing.
+	SelfSignedOnly bool
+}
+
 // Manager handles TLS certificate lifecycle.
 type Manager struct {
 	mu       sync.RWMutex
 	dir      string
 	certs    map[string]*CertInfo // keyed by hostname
 	tlsCerts map[string]*tls.Certificate
+
+	acmeManager    *autocert.Manager
+	selfSignedOnly bool
 }
 
-// NewManager creates a certificate manager.
+// NewManager creates a certificate manager with default settings (self-signed only).
 func NewManager(dataDir string) (*Manager, error) {
-	certsDir := filepath.Join(dataDir, "certs")
+	return NewManagerWithConfig(ManagerConfig{
+		DataDir:        dataDir,
+		SelfSignedOnly: true,
+	})
+}
+
+// NewManagerWithConfig creates a certificate manager with the given configuration.
+func NewManagerWithConfig(cfg ManagerConfig) (*Manager, error) {
+	certsDir := filepath.Join(cfg.DataDir, "certs")
 	if err := os.MkdirAll(certsDir, 0o700); err != nil {
 		return nil, fmt.Errorf("certs: create dir: %w", err)
 	}
 	m := &Manager{
-		dir:      certsDir,
-		certs:    make(map[string]*CertInfo),
-		tlsCerts: make(map[string]*tls.Certificate),
+		dir:            certsDir,
+		certs:          make(map[string]*CertInfo),
+		tlsCerts:       make(map[string]*tls.Certificate),
+		selfSignedOnly: cfg.SelfSignedOnly,
 	}
+
+	if !cfg.SelfSignedOnly {
+		am := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			Email:      cfg.ACMEEmail,
+			Cache:      autocert.DirCache(filepath.Join(certsDir, "acme-cache")),
+			HostPolicy: m.acmeHostPolicy,
+		}
+		if cfg.ACMEDirectory != "" {
+			am.Client = &acme.Client{
+				DirectoryURL: cfg.ACMEDirectory,
+			}
+		}
+		m.acmeManager = am
+	}
+
 	m.loadMetadata()
 	m.loadCertsFromDisk()
 
@@ -61,14 +109,35 @@ func NewManager(dataDir string) (*Manager, error) {
 
 // GetCertificate implements the tls.Config.GetCertificate callback.
 // This enables per-hostname TLS (SNI-based certificate selection).
+// For ACME-managed domains, it delegates to the autocert.Manager.
 func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	m.mu.RLock()
 	cert, ok := m.tlsCerts[hello.ServerName]
+	info := m.certs[hello.ServerName]
 	m.mu.RUnlock()
+
 	if ok {
 		return cert, nil
 	}
+
+	// Delegate to autocert for ACME-managed domains.
+	if m.acmeManager != nil && info != nil && info.Source == "acme" {
+		return m.acmeManager.GetCertificate(hello)
+	}
+
 	return nil, fmt.Errorf("no certificate for %s", hello.ServerName)
+}
+
+// acmeHostPolicy restricts which hosts the autocert.Manager will provision.
+// Only domains that have been explicitly requested via ProvisionACME are allowed.
+func (m *Manager) acmeHostPolicy(_ context.Context, host string) error {
+	m.mu.RLock()
+	info, ok := m.certs[host]
+	m.mu.RUnlock()
+	if ok && info.Source == "acme" {
+		return nil
+	}
+	return fmt.Errorf("host %q not allowed for ACME", host)
 }
 
 // StoreCert stores a custom PEM certificate and key for a hostname.
@@ -177,9 +246,9 @@ func (m *Manager) ProvisionSelfSigned(hostname string) error {
 }
 
 // ProvisionACME initiates ACME certificate provisioning for a hostname.
-// In production, this would use the ACME protocol (HTTP-01 or DNS-01 challenge).
-// This implementation provides the framework and logs the intent;
-// a full ACME client (like golang.org/x/crypto/acme) would be wired in for production.
+// When configured with a real ACME directory, it uses autocert to obtain
+// a certificate via Let's Encrypt (or the configured directory).
+// In self-signed-only mode (default for development), falls back to self-signed certs.
 func (m *Manager) ProvisionACME(hostname string) error {
 	// Check if we already have a valid cert.
 	m.mu.RLock()
@@ -189,27 +258,68 @@ func (m *Manager) ProvisionACME(hostname string) error {
 		return nil // Still valid for >30 days.
 	}
 
-	log.Printf("certs: ACME provisioning requested for %s (would use Let's Encrypt in production)", hostname)
-
-	// For now, fall back to self-signed so the system works end-to-end.
-	// In production, replace this with actual ACME flow:
-	//   1. Create authorization (HTTP-01 or DNS-01)
-	//   2. Respond to challenge
-	//   3. Finalize order and download cert
-	//   4. Store cert and schedule renewal
-	if err := m.ProvisionSelfSigned(hostname); err != nil {
-		return err
+	if m.selfSignedOnly || m.acmeManager == nil {
+		log.Printf("certs: ACME provisioning requested for %s (using self-signed fallback)", hostname)
+		if err := m.ProvisionSelfSigned(hostname); err != nil {
+			return err
+		}
+		// Mark as auto-renew so the renewal loop picks it up.
+		m.mu.Lock()
+		if ci, ok := m.certs[hostname]; ok {
+			ci.AutoRenew = true
+			ci.Source = "acme"
+		}
+		m.mu.Unlock()
+		m.saveMetadata()
+		return nil
 	}
 
-	// Mark as auto-renew so the renewal loop picks it up.
+	log.Printf("certs: ACME provisioning for %s via Let's Encrypt", hostname)
+
+	// Register the hostname in metadata first so the host policy allows it.
 	m.mu.Lock()
-	if ci, ok := m.certs[hostname]; ok {
-		ci.AutoRenew = true
-		ci.Source = "acme"
+	m.certs[hostname] = &CertInfo{
+		Hostname:  hostname,
+		AutoRenew: true,
+		Source:    "acme",
 	}
 	m.mu.Unlock()
 	m.saveMetadata()
 
+	// Trigger certificate fetch via autocert. The autocert.Manager handles
+	// the full ACME flow: account registration, authorization, challenge
+	// response, order finalization, and certificate download.
+	hello := &tls.ClientHelloInfo{ServerName: hostname}
+	cert, err := m.acmeManager.GetCertificate(hello)
+	if err != nil {
+		// Roll back metadata on failure.
+		m.mu.Lock()
+		delete(m.certs, hostname)
+		m.mu.Unlock()
+		m.saveMetadata()
+		return fmt.Errorf("certs: ACME provision for %s: %w", hostname, err)
+	}
+
+	// Parse the leaf to extract metadata.
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("certs: parse ACME cert for %s: %w", hostname, err)
+	}
+
+	m.mu.Lock()
+	m.certs[hostname] = &CertInfo{
+		Hostname:  hostname,
+		NotBefore: leaf.NotBefore,
+		NotAfter:  leaf.NotAfter,
+		Issuer:    leaf.Issuer.CommonName,
+		AutoRenew: true,
+		Source:    "acme",
+	}
+	m.tlsCerts[hostname] = cert
+	m.mu.Unlock()
+	m.saveMetadata()
+
+	log.Printf("certs: ACME cert provisioned for %s (expires %s)", hostname, leaf.NotAfter.Format(time.RFC3339))
 	return nil
 }
 

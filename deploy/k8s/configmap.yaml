@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cdn-config
+  labels:
+    app.kubernetes.io/part-of: cdn
+data:
+  CDN_LISTEN_ADDR: ":8080"
+  CDN_ORIGIN_URL: "https://origin.example.com"
+  CDN_DEFAULT_TTL: "300s"
+  CDN_MAX_CACHE_ITEMS: "10000"
+  CDN_DISK_CACHE_DIR: "/tmp/cdn-cache"
+  CDN_DISK_CACHE_MAX_MB: "512"
+  CDN_ORIGIN_TIMEOUT: "30s"
+  CDN_COMPRESSION_ENABLED: "true"
+  CDN_RATE_LIMIT_RPS: "100"
+  CDN_RATE_LIMIT_BURST: "200"
+  CDN_LOG_LEVEL: "info"
+  CDN_MAX_IDLE_CONNS_PER_HOST: "100"
+  CDN_DRAIN_DELAY: "5s"
+  CP_LISTEN: ":9090"
+  CP_DATA_DIR: "/data/cp"

@@ -121,35 +121,101 @@ func newCache(maxItems int, maxEntryBytes int64, maxKeyLen int, diskDir string, 
 	return c, nil
 }
 
+var builderPool = sync.Pool{
+	New: func() any {
+		b := &strings.Builder{}
+		b.Grow(256)
+		return b
+	},
+}
+
 // NormalizeKey builds a Vary-aware cache key from the primary key and request headers.
 func NormalizeKey(host, path string, query string, varyHeader string, reqHeaders http.Header) string {
-	// Normalize: sort query params, lowercase host.
-	host = strings.ToLower(host)
-	primary := host + path
+	// Fast path: no query, no vary, host already lowercase — just concatenate.
+	if query == "" && varyHeader == "" {
+		if isLowerASCII(host) {
+			return host + path
+		}
+		return strings.ToLower(host) + path
+	}
+
+	sb := builderPool.Get().(*strings.Builder)
+	sb.Reset()
+
+	// Normalize: lowercase host + path.
+	if isLowerASCII(host) {
+		sb.WriteString(host)
+	} else {
+		for i := 0; i < len(host); i++ {
+			c := host[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			sb.WriteByte(c)
+		}
+	}
+	sb.WriteString(path)
+
 	if query != "" {
-		primary += "?" + sortQuery(query)
+		sb.WriteByte('?')
+		writeSortedQuery(sb, query)
 	}
 
 	if varyHeader == "" {
-		return primary
+		result := sb.String()
+		builderPool.Put(sb)
+		return result
 	}
 
 	// Build secondary key from Vary header values.
 	vary := parseVary(varyHeader)
-	var parts []string
-	for _, h := range vary {
-		parts = append(parts, h+"="+reqHeaders.Get(h))
+	if len(vary) > 0 {
+		sb.WriteString("|vary:")
+		for i, h := range vary {
+			if i > 0 {
+				sb.WriteByte('&')
+			}
+			sb.WriteString(h)
+			sb.WriteByte('=')
+			sb.WriteString(reqHeaders.Get(h))
+		}
 	}
-	if len(parts) > 0 {
-		return primary + "|vary:" + strings.Join(parts, "&")
+	result := sb.String()
+	builderPool.Put(sb)
+	return result
+}
+
+// isLowerASCII returns true if s contains no uppercase ASCII letters.
+func isLowerASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return false
+		}
 	}
-	return primary
+	return true
 }
 
 func sortQuery(q string) string {
 	parts := strings.Split(q, "&")
 	sort.Strings(parts)
 	return strings.Join(parts, "&")
+}
+
+// writeSortedQuery writes sorted query params directly to the builder.
+func writeSortedQuery(sb *strings.Builder, q string) {
+	// If no '&', the query has a single param — no sorting needed.
+	if !strings.Contains(q, "&") {
+		sb.WriteString(q)
+		return
+	}
+	parts := strings.Split(q, "&")
+	sort.Strings(parts)
+	for i, p := range parts {
+		if i > 0 {
+			sb.WriteByte('&')
+		}
+		sb.WriteString(p)
+	}
 }
 
 func parseVary(vary string) []string {

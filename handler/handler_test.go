@@ -329,14 +329,15 @@ func TestSMaxagePreferred(t *testing.T) {
 	}
 }
 
-func TestByteRangePassthrough(t *testing.T) {
+func TestByteRangeServesFromCache(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "" {
-			t.Error("expected Range header to be forwarded to origin")
+		// The CDN should strip the Range header when fetching the full body.
+		if r.Header.Get("Range") != "" {
+			t.Error("CDN should strip Range header when fetching for cache")
 		}
-		w.Header().Set("Content-Range", "bytes 0-4/11")
-		w.WriteHeader(206)
-		w.Write([]byte("hello"))
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.WriteHeader(200)
+		w.Write([]byte("hello world"))
 	}))
 	defer origin.Close()
 
@@ -350,11 +351,15 @@ func TestByteRangePassthrough(t *testing.T) {
 	if w.Code != 206 {
 		t.Errorf("status = %d, want 206", w.Code)
 	}
-	if w.Header().Get("X-Cache") != "BYPASS" {
-		t.Errorf("X-Cache = %q, want BYPASS for range requests", w.Header().Get("X-Cache"))
+	if got := w.Body.String(); got != "hello" {
+		t.Errorf("body = %q, want %q", got, "hello")
 	}
-	if c.Len() != 0 {
-		t.Error("range request should not populate cache")
+	if got := w.Header().Get("Content-Range"); got != "bytes 0-4/11" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 0-4/11")
+	}
+	// Full response should be cached for future range requests.
+	if c.Len() == 0 {
+		t.Error("expected cache to be populated after range request")
 	}
 }
 

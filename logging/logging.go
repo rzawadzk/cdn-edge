@@ -157,11 +157,21 @@ func (l *Logger) Error(msg string, err error, requestID ...string) {
 	l.write(e)
 }
 
+var reqIDPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 8)
+		return &b
+	},
+}
+
 // GenerateRequestID creates a random 8-byte hex request ID.
 func GenerateRequestID() string {
-	b := make([]byte, 8)
+	bp := reqIDPool.Get().(*[]byte)
+	b := *bp
 	rand.Read(b)
-	return hex.EncodeToString(b)
+	s := hex.EncodeToString(b)
+	reqIDPool.Put(bp)
+	return s
 }
 
 // WithRequestID returns a new context with the given request ID.

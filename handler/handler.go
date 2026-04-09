@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rzawadzk/cdn-edge/cache"
@@ -46,11 +47,10 @@ func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Byte-range requests bypass cache and pass straight to origin.
-	// Full byte-range-aware caching (storing slices) is complex; for now we
-	// ensure Range requests work correctly by proxying them directly.
-	if r.Header.Get("Range") != "" {
-		h.proxyPassthrough(w, r)
+	// Byte-range requests: serve from cache if available, otherwise fetch full
+	// response, cache it, and serve the requested slice as 206.
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		h.serveByteRange(w, r, rangeHeader)
 		return
 	}
 
@@ -240,17 +240,58 @@ func (h *CDN) determineTTL(resp *proxy.Response) (ttl, swr time.Duration) {
 	return h.cfg.DefaultTTL, swr
 }
 
+// Pre-allocated header value slices for common cache status values.
+var (
+	cacheHit        = []string{"HIT"}
+	cacheMiss       = []string{"MISS"}
+	cacheStale      = []string{"STALE"}
+	cacheStaleError = []string{"STALE-ERROR"}
+	cacheBypass     = []string{"BYPASS"}
+)
+
+func cacheStatusSlice(status string) []string {
+	switch status {
+	case "HIT":
+		return cacheHit
+	case "MISS":
+		return cacheMiss
+	case "STALE":
+		return cacheStale
+	case "STALE-ERROR":
+		return cacheStaleError
+	case "BYPASS":
+		return cacheBypass
+	}
+	return []string{status}
+}
+
+// ageBuffer is used to format the Age header value without allocating.
+var ageBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 20)
+		return &b
+	},
+}
+
 func serveEntry(w http.ResponseWriter, entry *cache.Entry, cacheStatus string) {
+	h := w.Header()
+	// Copy headers directly into the map to avoid textproto canonicalization overhead.
+	// Entry headers already have canonical keys from net/http.
 	for k, vals := range entry.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
+		h[k] = vals
 	}
-	w.Header().Set("X-Cache", cacheStatus)
+	h["X-Cache"] = cacheStatusSlice(cacheStatus)
 	if entry.ETag != "" {
-		w.Header().Set("ETag", entry.ETag)
+		h["Etag"] = []string{entry.ETag}
 	}
-	w.Header().Set("Age", strconv.Itoa(int(time.Since(entry.StoredAt).Seconds())))
+	// Format Age header using pooled buffer to avoid strconv.Itoa allocation.
+	bp := ageBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	age := int(time.Since(entry.StoredAt).Seconds())
+	buf = strconv.AppendInt(buf, int64(age), 10)
+	h["Age"] = []string{string(buf)}
+	*bp = buf
+	ageBufPool.Put(bp)
 	w.WriteHeader(entry.StatusCode)
 	w.Write(entry.Body)
 }
@@ -275,9 +316,19 @@ func isCacheableStatus(code int) bool {
 }
 
 func hasCacheDirective(cc, directive string) bool {
-	for _, part := range strings.Split(cc, ",") {
-		key, _, _ := strings.Cut(strings.TrimSpace(strings.ToLower(part)), "=")
-		if strings.TrimSpace(key) == directive {
+	for cc != "" {
+		var part string
+		if i := strings.IndexByte(cc, ','); i >= 0 {
+			part = cc[:i]
+			cc = cc[i+1:]
+		} else {
+			part = cc
+			cc = ""
+		}
+		part = strings.TrimSpace(part)
+		key, _, _ := strings.Cut(part, "=")
+		key = strings.TrimSpace(key)
+		if strings.EqualFold(key, directive) {
 			return true
 		}
 	}
@@ -285,20 +336,101 @@ func hasCacheDirective(cc, directive string) bool {
 }
 
 func getCacheDirectiveValue(cc, directive string) time.Duration {
-	for _, part := range strings.Split(cc, ",") {
-		key, val, ok := strings.Cut(strings.TrimSpace(strings.ToLower(part)), "=")
-		if ok && strings.TrimSpace(key) == directive {
-			secs, err := strconv.Atoi(strings.TrimSpace(val))
-			if err == nil {
-				return time.Duration(secs) * time.Second
+	for cc != "" {
+		var part string
+		if i := strings.IndexByte(cc, ','); i >= 0 {
+			part = cc[:i]
+			cc = cc[i+1:]
+		} else {
+			part = cc
+			cc = ""
+		}
+		part = strings.TrimSpace(part)
+		key, val, ok := strings.Cut(part, "=")
+		if ok {
+			key = strings.TrimSpace(key)
+			if strings.EqualFold(key, directive) {
+				secs, err := strconv.Atoi(strings.TrimSpace(val))
+				if err == nil {
+					return time.Duration(secs) * time.Second
+				}
 			}
 		}
 	}
 	return 0
 }
 
+// serveByteRange handles Range requests by serving from cache or fetching the
+// full response, caching it, then serving the requested byte slice as 206.
+func (h *CDN) serveByteRange(w http.ResponseWriter, r *http.Request, rangeHeader string) {
+	primaryKey := cache.NormalizeKey(r.Host, r.URL.Path, r.URL.RawQuery, "", nil)
+
+	// Try to serve from existing cache entry.
+	if entry := h.cache.Get(primaryKey); entry != nil {
+		start, end, ok := parseRange(rangeHeader, len(entry.Body))
+		if !ok {
+			// Unparseable range (e.g. multi-range) — pass through to origin.
+			h.proxyPassthrough(w, r)
+			return
+		}
+		serveRange(w, entry, start, end)
+		return
+	}
+
+	// Not cached: fetch full response from origin (strip Range so we get complete body).
+	originURL := h.cfg.OriginURL + r.URL.RequestURI()
+	cleanHeader := r.Header.Clone()
+	cleanHeader.Del("Range")
+
+	resp, err := h.origin.Fetch(r.Context(), primaryKey, originURL, cleanHeader)
+	if err != nil {
+		reqID := logging.GetRequestID(r.Context())
+		h.log.Error("origin fetch failed", err, reqID)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	ttl, swr := h.determineTTL(resp)
+
+	if ttl > 0 && isCacheableStatus(resp.StatusCode) {
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			hash := sha256.Sum256(resp.Body)
+			etag = fmt.Sprintf(`"%x"`, hash[:8])
+		}
+		vary := resp.Header.Get("Vary")
+		cacheKey := cache.NormalizeKey(r.Host, r.URL.Path, r.URL.RawQuery, vary, r.Header)
+		entry := &cache.Entry{
+			Body:                 resp.Body,
+			Header:               resp.Header.Clone(),
+			StatusCode:           resp.StatusCode,
+			StoredAt:             time.Now(),
+			TTL:                  ttl,
+			ETag:                 etag,
+			LastMod:              resp.Header.Get("Last-Modified"),
+			VaryKey:              cacheKey,
+			StaleWhileRevalidate: swr,
+		}
+		h.cache.Put(primaryKey, entry)
+		if cacheKey != primaryKey {
+			h.cache.Put(cacheKey, entry)
+		}
+
+		start, end, ok := parseRange(rangeHeader, len(entry.Body))
+		if !ok {
+			serveEntry(w, entry, "MISS")
+			return
+		}
+		serveRange(w, entry, start, end)
+		return
+	}
+
+	// Not cacheable — pass through full response.
+	serveResponse(w, resp, "BYPASS")
+}
+
 // proxyPassthrough sends the request directly to origin without caching.
-// Used for Range requests and other non-cacheable request patterns.
+// Used for multi-range requests and other non-cacheable request patterns.
 func (h *CDN) proxyPassthrough(w http.ResponseWriter, r *http.Request) {
 	originURL := h.cfg.OriginURL + r.URL.RequestURI()
 	resp, err := h.origin.Fetch(r.Context(), "passthrough:"+r.URL.RequestURI(), originURL, r.Header)

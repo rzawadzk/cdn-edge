@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdn-edge
+  labels:
+    app.kubernetes.io/name: cdn-edge
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/part-of: cdn
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cdn-edge
+    app.kubernetes.io/component: edge
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

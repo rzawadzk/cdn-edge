@@ -73,7 +73,8 @@ func NewCollector(dataDir string) (*Collector, error) {
 }
 
 // Ingest processes a batch of log entries from an edge.
-func (c *Collector) Ingest(entries []LogEntry) {
+// Satisfies the Backend interface.
+func (c *Collector) Ingest(entries []LogEntry) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -109,10 +110,12 @@ func (c *Collector) Ingest(entries []LogEntry) {
 			ds.AvgLatencyMs = ds.totalLatency / float64(ds.Requests)
 		}
 	}
+	return nil
 }
 
 // Query returns stats for a domain, or all domains if hostname is empty.
-func (c *Collector) Query(hostname string) []*DomainStats {
+// Satisfies the Backend interface.
+func (c *Collector) Query(hostname string) ([]*DomainStats, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -123,7 +126,14 @@ func (c *Collector) Query(hostname string) []*DomainStats {
 			result = append(result, &cp)
 		}
 	}
-	return result
+	return result, nil
+}
+
+// Close flushes stats to disk and stops the collector.
+// Satisfies the Backend interface.
+func (c *Collector) Close() error {
+	c.flushStats()
+	return nil
 }
 
 // HandleIngest is an HTTP handler for POST /api/v1/analytics/ingest.
@@ -137,7 +147,10 @@ func (c *Collector) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	c.Ingest(entries)
+	if err := c.Ingest(entries); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"accepted":%d}`, len(entries))
 }
@@ -145,7 +158,11 @@ func (c *Collector) HandleIngest(w http.ResponseWriter, r *http.Request) {
 // HandleQuery is an HTTP handler for GET /api/v1/analytics/query.
 func (c *Collector) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	hostname := r.URL.Query().Get("hostname")
-	stats := c.Query(hostname)
+	stats, err := c.Query(hostname)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }

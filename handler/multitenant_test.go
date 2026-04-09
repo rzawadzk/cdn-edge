@@ -321,8 +321,10 @@ func TestMultiTenantHostWithPort(t *testing.T) {
 	}
 }
 
-func TestMultiTenantRangeBypass(t *testing.T) {
-	origin := setupTestOrigin(t, 200, nil, "full body")
+func TestMultiTenantRangeServesFromCache(t *testing.T) {
+	origin := setupTestOrigin(t, 200, map[string]string{
+		"Cache-Control": "max-age=300",
+	}, "full body content")
 	defer origin.Close()
 
 	mt, _ := newTestMultiTenantCDN(t)
@@ -332,12 +334,18 @@ func TestMultiTenantRangeBypass(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "http://acme.com/file", nil)
 	req.Host = "acme.com"
-	req.Header.Set("Range", "bytes=0-10")
+	req.Header.Set("Range", "bytes=0-3")
 	w := httptest.NewRecorder()
 	mt.ServeHTTP(w, req)
 
-	if w.Header().Get("X-Cache") != "BYPASS" {
-		t.Fatalf("Range request should bypass cache, got X-Cache=%q", w.Header().Get("X-Cache"))
+	if w.Code != 206 {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got := w.Body.String(); got != "full" {
+		t.Errorf("body = %q, want %q", got, "full")
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 0-3/17" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 0-3/17")
 	}
 }
 

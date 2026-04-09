@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/andybalholm/brotli"
 )
 
 var gzipWriterPool = sync.Pool{
@@ -15,95 +17,155 @@ var gzipWriterPool = sync.Pool{
 	},
 }
 
-// Middleware transparently compresses responses with gzip when the client supports it.
-// Brotli would require a third-party library; gzip is stdlib-only.
+var brotliWriterPool = sync.Pool{
+	New: func() any {
+		return brotli.NewWriterOptions(io.Discard, brotli.WriterOptions{Quality: 4})
+	},
+}
+
+type encoding int
+
+const (
+	encodingNone encoding = iota
+	encodingBrotli
+	encodingGzip
+)
+
+// Middleware transparently compresses responses with brotli or gzip when the
+// client supports it. Brotli is preferred over gzip when both are accepted.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip if client doesn't accept gzip.
-		if !acceptsGzip(r) {
+		enc := selectEncoding(r)
+		if enc == encodingNone {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		gz := gzipWriterPool.Get().(*gzip.Writer)
-		gz.Reset(w)
+		switch enc {
+		case encodingBrotli:
+			bw := brotliWriterPool.Get().(*brotli.Writer)
+			bw.Reset(w)
 
-		grw := &gzipResponseWriter{
-			ResponseWriter: w,
-			gz:             gz,
+			crw := &compressResponseWriter{
+				ResponseWriter: w,
+				writer:         bw,
+				encoding:       "br",
+			}
+			defer func() {
+				crw.Close()
+				brotliWriterPool.Put(bw)
+			}()
+
+			next.ServeHTTP(crw, r)
+
+		case encodingGzip:
+			gz := gzipWriterPool.Get().(*gzip.Writer)
+			gz.Reset(w)
+
+			crw := &compressResponseWriter{
+				ResponseWriter: w,
+				writer:         gz,
+				encoding:       "gzip",
+			}
+			defer func() {
+				crw.Close()
+				gzipWriterPool.Put(gz)
+			}()
+
+			next.ServeHTTP(crw, r)
 		}
-		defer func() {
-			grw.Close()
-			gzipWriterPool.Put(gz)
-		}()
-
-		next.ServeHTTP(grw, r)
 	})
 }
 
-type gzipResponseWriter struct {
-	http.ResponseWriter
-	gz            *gzip.Writer
-	headerWritten bool
-	shouldCompress bool
-	checked       bool
+// compressWriter is the interface satisfied by both gzip.Writer and brotli.Writer.
+type compressWriter interface {
+	io.Writer
+	Close() error
+	Flush() error
 }
 
-func (grw *gzipResponseWriter) check() {
-	if grw.checked {
+type compressResponseWriter struct {
+	http.ResponseWriter
+	writer         compressWriter
+	encoding       string
+	headerWritten  bool
+	shouldCompress bool
+	checked        bool
+}
+
+func (crw *compressResponseWriter) check() {
+	if crw.checked {
 		return
 	}
-	grw.checked = true
+	crw.checked = true
 
-	ct := grw.Header().Get("Content-Type")
+	ct := crw.Header().Get("Content-Type")
 	// Only compress text-like content types.
-	grw.shouldCompress = isCompressible(ct)
+	crw.shouldCompress = isCompressible(ct)
 
-	if grw.shouldCompress {
-		grw.Header().Del("Content-Length") // will change after compression
-		grw.Header().Set("Content-Encoding", "gzip")
-		grw.Header().Add("Vary", "Accept-Encoding")
+	if crw.shouldCompress {
+		crw.Header().Del("Content-Length") // will change after compression
+		crw.Header().Set("Content-Encoding", crw.encoding)
+		crw.Header().Add("Vary", "Accept-Encoding")
 	}
 }
 
-func (grw *gzipResponseWriter) WriteHeader(code int) {
-	grw.check()
-	grw.headerWritten = true
-	grw.ResponseWriter.WriteHeader(code)
+func (crw *compressResponseWriter) WriteHeader(code int) {
+	crw.check()
+	crw.headerWritten = true
+	crw.ResponseWriter.WriteHeader(code)
 }
 
-func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
-	if !grw.headerWritten {
+func (crw *compressResponseWriter) Write(b []byte) (int, error) {
+	if !crw.headerWritten {
 		// Sniff content type if not set.
-		if grw.Header().Get("Content-Type") == "" {
-			grw.Header().Set("Content-Type", http.DetectContentType(b))
+		if crw.Header().Get("Content-Type") == "" {
+			crw.Header().Set("Content-Type", http.DetectContentType(b))
 		}
-		grw.check()
-		grw.headerWritten = true
+		crw.check()
+		crw.headerWritten = true
 	}
-	if grw.shouldCompress {
-		return grw.gz.Write(b)
+	if crw.shouldCompress {
+		return crw.writer.Write(b)
 	}
-	return grw.ResponseWriter.Write(b)
+	return crw.ResponseWriter.Write(b)
 }
 
-func (grw *gzipResponseWriter) Close() {
-	if grw.shouldCompress {
-		grw.gz.Close()
+func (crw *compressResponseWriter) Close() {
+	if crw.shouldCompress {
+		crw.writer.Close()
 	}
 }
 
-func (grw *gzipResponseWriter) Unwrap() http.ResponseWriter {
-	return grw.ResponseWriter
+func (crw *compressResponseWriter) Unwrap() http.ResponseWriter {
+	return crw.ResponseWriter
 }
 
-func acceptsGzip(r *http.Request) bool {
-	for _, enc := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		if strings.TrimSpace(enc) == "gzip" {
-			return true
+// selectEncoding picks the best encoding the client supports.
+// Brotli is preferred over gzip when both are accepted.
+func selectEncoding(r *http.Request) encoding {
+	ae := r.Header.Get("Accept-Encoding")
+	hasBrotli := false
+	hasGzip := false
+	for _, enc := range strings.Split(ae, ",") {
+		// Strip quality values (e.g. "gzip;q=0.8") for simple matching.
+		enc = strings.TrimSpace(enc)
+		enc, _, _ = strings.Cut(enc, ";")
+		enc = strings.TrimSpace(enc)
+		switch enc {
+		case "br":
+			hasBrotli = true
+		case "gzip":
+			hasGzip = true
 		}
 	}
-	return false
+	if hasBrotli {
+		return encodingBrotli
+	}
+	if hasGzip {
+		return encodingGzip
+	}
+	return encodingNone
 }
 
 func isCompressible(ct string) bool {

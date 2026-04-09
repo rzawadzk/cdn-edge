@@ -20,9 +20,14 @@ func TestIngestAndQuery(t *testing.T) {
 		{Host: "acme.com", Status: 404, BytesSent: 100, DurationMs: 1.0, CacheStatus: "MISS"},
 		{Host: "other.com", Status: 500, BytesSent: 50, DurationMs: 100.0, CacheStatus: "BYPASS"},
 	}
-	c.Ingest(entries)
+	if err := c.Ingest(entries); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
 
-	stats := c.Query("acme.com")
+	stats, err := c.Query("acme.com")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
 	if len(stats) != 1 {
 		t.Fatalf("query acme.com: got %d results", len(stats))
 	}
@@ -46,7 +51,7 @@ func TestIngestAndQuery(t *testing.T) {
 		t.Fatalf("4xx = %d, want 1", s.Status4xx)
 	}
 
-	all := c.Query("")
+	all, _ := c.Query("")
 	if len(all) != 2 {
 		t.Fatalf("query all: got %d results, want 2", len(all))
 	}
@@ -58,7 +63,7 @@ func TestAvgLatency(t *testing.T) {
 		{Host: "a.com", Status: 200, DurationMs: 10.0},
 		{Host: "a.com", Status: 200, DurationMs: 20.0},
 	})
-	stats := c.Query("a.com")
+	stats, _ := c.Query("a.com")
 	if len(stats) != 1 {
 		t.Fatal("expected 1 result")
 	}
@@ -74,7 +79,7 @@ func TestStatusCodeBuckets(t *testing.T) {
 		{Host: "a.com", Status: 302},
 		{Host: "a.com", Status: 503},
 	})
-	stats := c.Query("a.com")
+	stats, _ := c.Query("a.com")
 	s := stats[0]
 	if s.Status3xx != 2 {
 		t.Fatalf("3xx = %d, want 2", s.Status3xx)
@@ -89,7 +94,7 @@ func TestCacheStatusSTALE(t *testing.T) {
 	c.Ingest([]LogEntry{
 		{Host: "a.com", Status: 200, CacheStatus: "STALE"},
 	})
-	stats := c.Query("a.com")
+	stats, _ := c.Query("a.com")
 	if stats[0].CacheHits != 1 {
 		t.Fatal("STALE should count as cache hit")
 	}
@@ -107,7 +112,8 @@ func TestHandleIngest(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", w.Code)
 	}
-	if c.Query("a.com")[0].Requests != 1 {
+	s, _ := c.Query("a.com")
+	if s[0].Requests != 1 {
 		t.Fatal("entry not ingested")
 	}
 }
@@ -157,7 +163,7 @@ func TestPersistence(t *testing.T) {
 	c1.flushStats()
 
 	c2, _ := NewCollector(dir)
-	stats := c2.Query("a.com")
+	stats, _ := c2.Query("a.com")
 	if len(stats) != 1 || stats[0].Requests != 1 {
 		t.Fatal("stats not persisted")
 	}
