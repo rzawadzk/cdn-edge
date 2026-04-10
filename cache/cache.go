@@ -14,19 +14,47 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
+// ---------- Entry (unchanged) ----------
+
 // Entry represents a cached HTTP response.
+//
+// Headers may be stored either in Header (uncompressed, fastest access) or
+// in CompressedHeader (zstd-compressed, smaller memory footprint). Callers
+// should use GetHeader() which returns whichever is populated. When the
+// cache is configured with Options.CompressHeaders, Put() will compress
+// Header and clear the raw field to save RAM.
 type Entry struct {
-	Body       []byte
-	Header     http.Header
-	StatusCode int
-	StoredAt   time.Time
-	TTL        time.Duration
-	ETag       string
-	LastMod    string
-	VaryKey    string // secondary key derived from Vary headers
+	Body             []byte
+	Header           http.Header
+	CompressedHeader *CompressedHeader
+	StatusCode       int
+	StoredAt         time.Time
+	TTL              time.Duration
+	ETag             string
+	LastMod          string
+	VaryKey          string // secondary key derived from Vary headers
 	StaleWhileRevalidate time.Duration
+}
+
+// GetHeader returns the entry's headers, decoding the compressed form on
+// demand if Header is nil. The returned map is safe to read; callers must
+// clone it before mutating (Decode() already returns a fresh map, but Header
+// may alias the original response for uncompressed entries).
+func (e *Entry) GetHeader() http.Header {
+	if e == nil {
+		return nil
+	}
+	if e.Header != nil {
+		return e.Header
+	}
+	if e.CompressedHeader != nil {
+		return e.CompressedHeader.Decode()
+	}
+	return http.Header{}
 }
 
 // IsExpired returns true if this entry has passed its TTL.
@@ -46,6 +74,8 @@ func (e *Entry) IsStaleServable() bool {
 	return age > e.TTL && age <= e.TTL+e.StaleWhileRevalidate
 }
 
+// ---------- Stats ----------
+
 // Stats holds cache hit/miss counters.
 type Stats struct {
 	Hits       atomic.Int64
@@ -54,18 +84,27 @@ type Stats struct {
 	StaleHits  atomic.Int64
 }
 
-// Cache is a two-tier cache: in-memory LRU backed by optional disk storage.
-type Cache struct {
-	mu             sync.RWMutex
-	items          map[string]*list.Element
-	eviction       *list.List
-	maxItems       int
-	maxEntryBytes  int64
-	maxKeyLen      int
-	diskDir        string
-	diskMaxBytes   int64
-	diskUsedBytes  int64
-	stats          Stats
+// ---------- Options ----------
+
+// Options configures the cache.
+type Options struct {
+	MaxItems        int
+	MaxEntryBytes   int64
+	MaxKeyLen       int
+	DiskDir         string
+	DiskMaxBytes    int64
+	NumShards       int  // number of shards (default 256, must be power of 2)
+	CompressHeaders bool // zstd-compress cached HTTP headers to reduce RAM use
+}
+
+// ---------- Shard ----------
+
+// cacheShard is a single LRU partition with its own lock.
+type cacheShard struct {
+	mu        sync.RWMutex
+	items     map[string]*list.Element
+	eviction  *list.List
+	maxItems  int
 }
 
 type lruItem struct {
@@ -73,19 +112,36 @@ type lruItem struct {
 	entry *Entry
 }
 
-// New creates a cache with the given maximum in-memory item count.
-// If diskDir is non-empty, evicted items are persisted to disk.
-// Options configures the cache.
-type Options struct {
-	MaxItems      int
-	MaxEntryBytes int64
-	MaxKeyLen     int
-	DiskDir       string
-	DiskMaxBytes  int64
+func newShard(maxItems int) *cacheShard {
+	return &cacheShard{
+		items:    make(map[string]*list.Element),
+		eviction: list.New(),
+		maxItems: maxItems,
+	}
+}
+
+// ---------- Cache (sharded + TinyLFU) ----------
+
+const defaultNumShards = 256
+
+// Cache is a sharded two-tier cache: in-memory LRU shards with TinyLFU
+// admission backed by optional disk storage. The disk tier is shared.
+type Cache struct {
+	shards          []*cacheShard
+	numShards       uint64
+	shardMask       uint64 // numShards - 1
+	maxEntryBytes   int64
+	maxKeyLen       int
+	diskDir         string
+	diskMaxBytes    int64
+	diskMu          sync.Mutex // protects disk operations
+	diskUsedBytes   int64
+	stats           Stats
+	lfu             *TinyLFU
+	compressHeaders bool
 }
 
 // New creates a cache with the given options.
-// For backwards compatibility, also accepts positional args via NewLegacy.
 func New(maxItems int, maxEntryBytes int64, diskDir string, diskMaxBytes int64) (*Cache, error) {
 	return NewWithOptions(Options{
 		MaxItems:      maxItems,
@@ -97,29 +153,73 @@ func New(maxItems int, maxEntryBytes int64, diskDir string, diskMaxBytes int64) 
 
 // NewWithOptions creates a cache from Options.
 func NewWithOptions(opts Options) (*Cache, error) {
-	return newCache(opts.MaxItems, opts.MaxEntryBytes, opts.MaxKeyLen, opts.DiskDir, opts.DiskMaxBytes)
-}
+	numShards := opts.NumShards
+	if numShards <= 0 {
+		numShards = defaultNumShards
+	}
+	// Round up to power of two.
+	numShards = int(nextPow2(uint64(numShards)))
 
-func newCache(maxItems int, maxEntryBytes int64, maxKeyLen int, diskDir string, diskMaxBytes int64) (*Cache, error) {
-	if diskDir != "" {
-		if err := os.MkdirAll(diskDir, 0o755); err != nil {
+	maxItems := opts.MaxItems
+	if maxItems < 1 {
+		maxItems = 1
+	}
+	// For small caches, collapse to a single shard so the aggregate capacity
+	// equals MaxItems exactly. Sharding only pays off above ~64 items.
+	if maxItems < 64 {
+		numShards = 1
+	}
+	// Never have more shards than items.
+	for numShards > maxItems {
+		numShards /= 2
+	}
+	if numShards < 1 {
+		numShards = 1
+	}
+
+	if opts.DiskDir != "" {
+		if err := os.MkdirAll(opts.DiskDir, 0o755); err != nil {
 			return nil, fmt.Errorf("cache: create disk dir: %w", err)
 		}
 	}
+
+	// Distribute capacity across shards, spreading the remainder across the
+	// first N shards so the total matches maxItems exactly.
+	perShard := maxItems / numShards
+	remainder := maxItems % numShards
+
 	c := &Cache{
-		items:         make(map[string]*list.Element),
-		eviction:      list.New(),
-		maxItems:      maxItems,
-		maxEntryBytes: maxEntryBytes,
-		maxKeyLen:     maxKeyLen,
-		diskDir:       diskDir,
-		diskMaxBytes:  diskMaxBytes,
+		shards:          make([]*cacheShard, numShards),
+		numShards:       uint64(numShards),
+		shardMask:       uint64(numShards) - 1,
+		maxEntryBytes:   opts.MaxEntryBytes,
+		maxKeyLen:       opts.MaxKeyLen,
+		diskDir:         opts.DiskDir,
+		diskMaxBytes:    opts.DiskMaxBytes,
+		lfu:             newTinyLFU(maxItems),
+		compressHeaders: opts.CompressHeaders,
 	}
-	if diskDir != "" {
+	for i := range c.shards {
+		cap := perShard
+		if i < remainder {
+			cap++
+		}
+		c.shards[i] = newShard(cap)
+	}
+
+	if opts.DiskDir != "" {
 		c.diskUsedBytes = c.calculateDiskUsage()
 	}
+
 	return c, nil
 }
+
+func (c *Cache) getShard(key string) *cacheShard {
+	h := xxhash.Sum64String(key)
+	return c.shards[h&c.shardMask]
+}
+
+// ---------- NormalizeKey (unchanged) ----------
 
 var builderPool = sync.Pool{
 	New: func() any {
@@ -185,7 +285,6 @@ func NormalizeKey(host, path string, query string, varyHeader string, reqHeaders
 	return result
 }
 
-// isLowerASCII returns true if s contains no uppercase ASCII letters.
 func isLowerASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 'A' && s[i] <= 'Z' {
@@ -201,9 +300,7 @@ func sortQuery(q string) string {
 	return strings.Join(parts, "&")
 }
 
-// writeSortedQuery writes sorted query params directly to the builder.
 func writeSortedQuery(sb *strings.Builder, q string) {
-	// If no '&', the query has a single param — no sorting needed.
 	if !strings.Contains(q, "&") {
 		sb.WriteString(q)
 		return
@@ -220,7 +317,7 @@ func writeSortedQuery(sb *strings.Builder, q string) {
 
 func parseVary(vary string) []string {
 	if vary == "*" {
-		return nil // Vary: * means never cache (handled by caller)
+		return nil
 	}
 	var headers []string
 	for _, h := range strings.Split(vary, ",") {
@@ -233,34 +330,47 @@ func parseVary(vary string) []string {
 	return headers
 }
 
+// ---------- Get ----------
+
 // Get retrieves an entry by key. Returns nil on miss.
 // If the entry is stale but within stale-while-revalidate, it is still returned
 // (caller should check IsStaleServable and trigger async revalidation).
 func (c *Cache) Get(key string) *Entry {
-	c.mu.RLock()
-	elem, ok := c.items[key]
-	c.mu.RUnlock()
+	// Always record frequency for TinyLFU admission decisions.
+	c.lfu.Increment(key)
 
+	shard := c.getShard(key)
+
+	// Take the write lock directly: we need it to move the element to the
+	// front on a hit, and dereferencing elem.Value lock-free races with a
+	// concurrent Put() that rewrites the lruItem's entry field in place.
+	shard.mu.Lock()
+	elem, ok := shard.items[key]
 	if ok {
 		entry := elem.Value.(*lruItem).entry
 		if entry.IsExpired() {
 			if entry.IsStaleServable() {
-				c.mu.Lock()
-				c.eviction.MoveToFront(elem)
-				c.mu.Unlock()
+				shard.eviction.MoveToFront(elem)
+				shard.mu.Unlock()
 				c.stats.StaleHits.Add(1)
 				return entry
 			}
-			c.Delete(key)
+			// Remove expired entry while we still hold the lock.
+			shard.eviction.Remove(elem)
+			delete(shard.items, key)
+			shard.mu.Unlock()
+			if c.diskDir != "" {
+				c.removeFromDisk(key)
+			}
 			c.stats.Misses.Add(1)
 			return nil
 		}
-		c.mu.Lock()
-		c.eviction.MoveToFront(elem)
-		c.mu.Unlock()
+		shard.eviction.MoveToFront(elem)
+		shard.mu.Unlock()
 		c.stats.Hits.Add(1)
 		return entry
 	}
+	shard.mu.Unlock()
 
 	// Try disk.
 	if c.diskDir != "" {
@@ -271,7 +381,7 @@ func (c *Cache) Get(key string) *Entry {
 				c.stats.Misses.Add(1)
 				return nil
 			}
-			c.put(key, entry)
+			c.putInShard(shard, key, entry)
 			if entry.IsExpired() {
 				c.stats.StaleHits.Add(1)
 			} else {
@@ -285,93 +395,131 @@ func (c *Cache) Get(key string) *Entry {
 	return nil
 }
 
+// ---------- Put ----------
+
 // Put stores an entry in the cache. Respects maxEntryBytes and maxKeyLen.
+// When CompressHeaders is enabled, the entry's Header is compressed into
+// CompressedHeader and the raw map is cleared to save memory.
 func (c *Cache) Put(key string, entry *Entry) {
 	if c.maxEntryBytes > 0 && int64(len(entry.Body)) > c.maxEntryBytes {
-		return // too large to cache
+		return
 	}
 	if c.maxKeyLen > 0 && len(key) > c.maxKeyLen {
-		return // key too long — pathological URL
+		return
 	}
-	c.put(key, entry)
+	if c.compressHeaders && entry.Header != nil && entry.CompressedHeader == nil {
+		entry.CompressedHeader = NewCompressedHeader(entry.Header)
+		entry.Header = nil
+	}
+	shard := c.getShard(key)
+	c.putInShard(shard, key, entry)
 }
 
-func (c *Cache) put(key string, entry *Entry) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Cache) putInShard(shard *cacheShard, key string, entry *Entry) {
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if elem, ok := c.items[key]; ok {
-		c.eviction.MoveToFront(elem)
+	// Update existing entry.
+	if elem, ok := shard.items[key]; ok {
+		shard.eviction.MoveToFront(elem)
 		elem.Value.(*lruItem).entry = entry
 		return
 	}
 
-	for c.eviction.Len() >= c.maxItems {
-		c.evictOldest()
+	// Need to evict? Check TinyLFU admission.
+	for shard.eviction.Len() >= shard.maxItems {
+		victim := shard.eviction.Back()
+		if victim == nil {
+			break
+		}
+		victimItem := victim.Value.(*lruItem)
+		if !c.lfu.Admit(key, victimItem.key) {
+			// Victim is more popular — reject the newcomer.
+			return
+		}
+		c.evictItem(shard, victim)
 	}
 
-	elem := c.eviction.PushFront(&lruItem{key: key, entry: entry})
-	c.items[key] = elem
+	elem := shard.eviction.PushFront(&lruItem{key: key, entry: entry})
+	shard.items[key] = elem
 }
+
+// evictItem removes the LRU victim from the shard (caller holds shard.mu.Lock).
+func (c *Cache) evictItem(shard *cacheShard, elem *list.Element) {
+	item := elem.Value.(*lruItem)
+	shard.eviction.Remove(elem)
+	delete(shard.items, item.key)
+	c.stats.Evicts.Add(1)
+
+	if c.diskDir != "" {
+		c.spillToDisk(item.key, item.entry)
+	}
+}
+
+// ---------- Delete ----------
 
 // Delete removes an entry from both memory and disk.
 func (c *Cache) Delete(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(key)
+	c.deleteShard(shard, key)
+}
 
-	if elem, ok := c.items[key]; ok {
-		c.eviction.Remove(elem)
-		delete(c.items, key)
+func (c *Cache) deleteShard(shard *cacheShard, key string) {
+	shard.mu.Lock()
+	if elem, ok := shard.items[key]; ok {
+		shard.eviction.Remove(elem)
+		delete(shard.items, key)
 	}
+	shard.mu.Unlock()
+
 	if c.diskDir != "" {
 		c.removeFromDisk(key)
 	}
 }
 
-// Purge clears all cached entries.
-func (c *Cache) Purge() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// ---------- Purge ----------
 
-	c.items = make(map[string]*list.Element)
-	c.eviction.Init()
+// Purge clears all cached entries from memory.
+func (c *Cache) Purge() {
+	for _, shard := range c.shards {
+		shard.mu.Lock()
+		shard.items = make(map[string]*list.Element)
+		shard.eviction.Init()
+		shard.mu.Unlock()
+	}
 }
+
+// ---------- GetStats ----------
 
 // GetStats returns current hit/miss/eviction/stale counters.
 func (c *Cache) GetStats() (hits, misses, evicts, staleHits int64) {
 	return c.stats.Hits.Load(), c.stats.Misses.Load(), c.stats.Evicts.Load(), c.stats.StaleHits.Load()
 }
 
+// ---------- Len ----------
+
 // Len returns the number of items currently in memory.
 func (c *Cache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.items)
+	total := 0
+	for _, shard := range c.shards {
+		shard.mu.RLock()
+		total += len(shard.items)
+		shard.mu.RUnlock()
+	}
+	return total
 }
 
-func (c *Cache) evictOldest() {
-	elem := c.eviction.Back()
-	if elem == nil {
-		return
-	}
-	item := elem.Value.(*lruItem)
-	c.eviction.Remove(elem)
-	delete(c.items, item.key)
-	c.stats.Evicts.Add(1)
-
-	// Spill to disk if space allows.
-	if c.diskDir != "" {
-		c.spillToDisk(item.key, item.entry)
-	}
-}
+// ---------- Disk tier (shared, protected by diskMu) ----------
 
 func (c *Cache) spillToDisk(key string, entry *Entry) {
+	c.diskMu.Lock()
+	defer c.diskMu.Unlock()
+
 	if c.diskMaxBytes > 0 {
-		entrySize := int64(len(entry.Body) + 512) // rough estimate including headers
-		// Evict oldest disk entries if over budget.
+		entrySize := int64(len(entry.Body) + 512)
 		for c.diskUsedBytes+entrySize > c.diskMaxBytes {
 			if !c.evictOldestDiskEntry() {
-				return // can't free space
+				return
 			}
 		}
 	}
@@ -454,9 +602,15 @@ func (c *Cache) diskPath(key string) string {
 }
 
 func (c *Cache) saveToDisk(key string, entry *Entry) error {
+	// Decode compressed headers for disk persistence (JSON disk format uses
+	// the plain http.Header representation).
+	hdr := entry.Header
+	if hdr == nil && entry.CompressedHeader != nil {
+		hdr = entry.CompressedHeader.Decode()
+	}
 	de := diskEntry{
 		Body:                 entry.Body,
-		Header:               entry.Header,
+		Header:               hdr,
 		StatusCode:           entry.StatusCode,
 		StoredAt:             entry.StoredAt,
 		TTLNs:                int64(entry.TTL),
@@ -481,7 +635,7 @@ func (c *Cache) loadFromDisk(key string) (*Entry, error) {
 	if err := json.Unmarshal(data, &de); err != nil {
 		return nil, err
 	}
-	return &Entry{
+	e := &Entry{
 		Body:                 de.Body,
 		Header:               de.Header,
 		StatusCode:           de.StatusCode,
@@ -491,10 +645,20 @@ func (c *Cache) loadFromDisk(key string) (*Entry, error) {
 		LastMod:              de.LastMod,
 		VaryKey:              de.VaryKey,
 		StaleWhileRevalidate: time.Duration(de.StaleWhileRevalidate),
-	}, nil
+	}
+	// When header compression is enabled, re-compress on load so the
+	// promoted in-memory entry also saves RAM.
+	if c.compressHeaders && e.Header != nil {
+		e.CompressedHeader = NewCompressedHeader(e.Header)
+		e.Header = nil
+	}
+	return e, nil
 }
 
 func (c *Cache) removeFromDisk(key string) error {
+	c.diskMu.Lock()
+	defer c.diskMu.Unlock()
+
 	path := c.diskPath(key)
 	info, err := os.Stat(path)
 	if err != nil {

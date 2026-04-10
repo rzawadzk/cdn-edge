@@ -86,8 +86,9 @@ func parseRange(rangeHeader string, contentLength int) (start, end int, ok bool)
 func serveRange(w http.ResponseWriter, entry *cache.Entry, start, end int) {
 	total := len(entry.Body)
 
-	// Copy relevant headers from the cached entry.
-	for k, vals := range entry.Header {
+	// Copy relevant headers from the cached entry. GetHeader() decodes the
+	// compressed form on demand when header compression is enabled.
+	for k, vals := range entry.GetHeader() {
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}

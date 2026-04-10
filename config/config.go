@@ -58,6 +58,10 @@ type Config struct {
 	// Cache limits
 	MaxCacheEntryBytes int64 // max size of a single cache entry in bytes; 0 = no limit
 
+	// CompressHeaders enables zstd compression of cached HTTP headers to
+	// reduce in-memory footprint (typically ~3x for realistic headers).
+	CompressHeaders bool
+
 	// Origin fetch
 	CoalesceTimeout time.Duration // max time waiters block on a coalesced request
 
@@ -86,6 +90,12 @@ type Config struct {
 	TracingEndpoint   string  // OTLP collector gRPC endpoint
 	TracingSampleRate float64 // trace sample rate 0.0-1.0
 	TracingInsecure   bool    // use insecure gRPC connection
+
+	// Uncacheable URL predictor — skips cache lookup for URLs repeatedly
+	// observed to be uncacheable (e.g. /api/*, /health).
+	PredictorEnabled  bool          // enable the predictor
+	PredictorCapacity int           // approximate number of tracked keys
+	PredictorDecay    time.Duration // decay interval for bucket rotation
 }
 
 // Load parses config from flags, then overlays environment variables.
@@ -143,6 +153,9 @@ func Load() (*Config, error) {
 	// Cache key
 	flag.IntVar(&cfg.MaxCacheKeyLen, "max-cache-key-len", 8192, "max cache key length in bytes")
 
+	// Header compression
+	flag.BoolVar(&cfg.CompressHeaders, "compress-headers", false, "zstd-compress cached HTTP headers to reduce RAM use")
+
 	// Multi-tenant mode
 	flag.StringVar(&cfg.ControlPlaneURL, "control-plane", "", "control plane URL (enables multi-tenant mode)")
 	flag.DurationVar(&cfg.ConfigPollInterval, "config-poll-interval", 30*time.Second, "config poll interval in multi-tenant mode")
@@ -152,6 +165,11 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.TracingEndpoint, "tracing-endpoint", "localhost:4317", "OTLP collector gRPC endpoint")
 	flag.Float64Var(&cfg.TracingSampleRate, "tracing-sample-rate", 1.0, "trace sample rate (0.0-1.0)")
 	flag.BoolVar(&cfg.TracingInsecure, "tracing-insecure", true, "use insecure gRPC for OTLP")
+
+	// Uncacheable URL predictor
+	flag.BoolVar(&cfg.PredictorEnabled, "predictor", true, "enable uncacheable-URL predictor (skips cache lookup for known-uncacheable URLs)")
+	flag.IntVar(&cfg.PredictorCapacity, "predictor-capacity", 10000, "approximate number of keys tracked by the predictor")
+	flag.DurationVar(&cfg.PredictorDecay, "predictor-decay", 5*time.Minute, "predictor decay / bucket rotation interval")
 
 	flag.Parse()
 
@@ -199,6 +217,7 @@ func (cfg *Config) applyEnv() {
 	envInt(&cfg.MaxIdleConnsPerHost, "CDN_MAX_IDLE_CONNS_PER_HOST")
 	envDuration(&cfg.DrainDelay, "CDN_DRAIN_DELAY")
 	envInt(&cfg.MaxCacheKeyLen, "CDN_MAX_CACHE_KEY_LEN")
+	envBool(&cfg.CompressHeaders, "CDN_COMPRESS_HEADERS")
 	envStr(&cfg.ControlPlaneURL, "CDN_CONTROL_PLANE")
 	envDuration(&cfg.ConfigPollInterval, "CDN_CONFIG_POLL_INTERVAL")
 
@@ -206,6 +225,10 @@ func (cfg *Config) applyEnv() {
 	envStr(&cfg.TracingEndpoint, "CDN_TRACING_ENDPOINT")
 	envFloat64(&cfg.TracingSampleRate, "CDN_TRACING_SAMPLE_RATE")
 	envBool(&cfg.TracingInsecure, "CDN_TRACING_INSECURE")
+
+	envBool(&cfg.PredictorEnabled, "CDN_PREDICTOR")
+	envInt(&cfg.PredictorCapacity, "CDN_PREDICTOR_CAPACITY")
+	envDuration(&cfg.PredictorDecay, "CDN_PREDICTOR_DECAY")
 }
 
 func (cfg *Config) validate() error {

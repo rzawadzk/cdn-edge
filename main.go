@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/rzawadzk/cdn-edge/compress"
 	"github.com/rzawadzk/cdn-edge/config"
 	"github.com/rzawadzk/cdn-edge/handler"
+	"github.com/rzawadzk/cdn-edge/handshake"
 	"github.com/rzawadzk/cdn-edge/logging"
 	"github.com/rzawadzk/cdn-edge/metrics"
 	"github.com/rzawadzk/cdn-edge/middleware"
@@ -53,11 +55,12 @@ func main() {
 
 	// Initialize cache.
 	c, err := cache.NewWithOptions(cache.Options{
-		MaxItems:      cfg.MaxCacheItems,
-		MaxEntryBytes: cfg.MaxCacheEntryBytes,
-		MaxKeyLen:     cfg.MaxCacheKeyLen,
-		DiskDir:       cfg.DiskCacheDir,
-		DiskMaxBytes:  cfg.DiskCacheMaxMB << 20,
+		MaxItems:        cfg.MaxCacheItems,
+		MaxEntryBytes:   cfg.MaxCacheEntryBytes,
+		MaxKeyLen:       cfg.MaxCacheKeyLen,
+		DiskDir:         cfg.DiskCacheDir,
+		DiskMaxBytes:    cfg.DiskCacheMaxMB << 20,
+		CompressHeaders: cfg.CompressHeaders,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize cache: %v", err)
@@ -85,16 +88,30 @@ func main() {
 	// Build the data-plane handler: single-tenant or multi-tenant.
 	var appHandler http.Handler
 
+	// Long-lived context for background workers (predictor decay, etc.),
+	// cancelled during shutdown.
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+
 	var mtHandler *handler.MultiTenantCDN // nil unless multi-tenant
 	if cfg.ControlPlaneURL != "" {
 		// Multi-tenant mode: route by Host header, config from control plane.
 		mtHandler = handler.NewMultiTenant(c, origin, logger, cfg.DefaultTTL)
+		if cfg.PredictorEnabled {
+			mtHandler.EnablePredictor(cache.NewPredictor(cfg.PredictorCapacity, cfg.PredictorDecay))
+		}
+		mtHandler.Start(bgCtx)
 		appHandler = mtHandler
 		logger.Info("multi-tenant mode enabled, control plane: " + cfg.ControlPlaneURL)
 	} else {
 		// Single-tenant mode: original behavior.
 		cdn := handler.New(c, origin, cfg, logger)
+		cdn.Start(bgCtx)
 		appHandler = cdn
+	}
+
+	if cfg.PredictorEnabled {
+		logger.Info("uncacheable-URL predictor enabled")
 	}
 
 	if cfg.CompressionEnabled {
@@ -221,6 +238,30 @@ func main() {
 		}()
 	}
 
+	// Build the listener used by srv.Serve. When TLS is enabled (and not
+	// auto / ACME managed), wrap with the handshake offload listener so
+	// TLS handshakes run on a dedicated worker pool rather than competing
+	// with request-serving goroutines.
+	var serveLn net.Listener = ln
+	var hsListener *handshake.OffloadListener
+	if cfg.TLSEnabled && !cfg.TLSAuto {
+		hsListener = handshake.NewOffloadListener(ln, srv.TLSConfig, handshake.Config{
+			// Use defaults: Workers=NumCPU*2, QueueSize=1024, Timeout=10s.
+		})
+		hsListener.SetLogger(logger)
+		serveLn = hsListener
+	}
+
+	// Register handshake stats endpoint (authenticated) if the offload
+	// listener is active.
+	if hsListener != nil {
+		mainMux.HandleFunc("/handshake-stats", metrics.AdminAuth(cfg.AdminAPIKey, func(w http.ResponseWriter, r *http.Request) {
+			q, c, f := hsListener.Stats()
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"queued":%d,"completed":%d,"failed":%d}`, q, c, f)
+		}))
+	}
+
 	go func() {
 		if cfg.ControlPlaneURL != "" {
 			logger.Info("CDN edge server listening on " + cfg.ListenAddr + " (multi-tenant, control plane: " + cfg.ControlPlaneURL + ")")
@@ -229,11 +270,6 @@ func main() {
 		}
 		met.SetReady(true)
 
-		var serveLn net.Listener = ln
-		if cfg.TLSEnabled && !cfg.TLSAuto {
-			tlsLn := tls.NewListener(ln, srv.TLSConfig)
-			serveLn = tlsLn
-		}
 		if err := srv.Serve(serveLn); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}

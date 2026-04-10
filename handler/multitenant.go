@@ -28,6 +28,7 @@ type MultiTenantCDN struct {
 	log    *logging.Logger
 
 	defaultTTL time.Duration
+	predictor  *cache.Predictor // nil when disabled
 }
 
 // NewMultiTenant creates a multi-tenant CDN handler.
@@ -39,6 +40,23 @@ func NewMultiTenant(c *cache.Cache, o *proxy.Origin, log *logging.Logger, defaul
 		defaultTTL: defaultTTL,
 	}
 }
+
+// EnablePredictor attaches an uncacheable-URL predictor to the handler.
+// Must be called before Start. Pass nil to disable.
+func (h *MultiTenantCDN) EnablePredictor(p *cache.Predictor) {
+	h.predictor = p
+}
+
+// Start launches background workers for the handler (currently: predictor
+// decay). Call once at startup with a context that cancels on shutdown.
+func (h *MultiTenantCDN) Start(ctx context.Context) {
+	if h.predictor != nil {
+		go h.predictor.StartDecay(ctx)
+	}
+}
+
+// Predictor returns the attached uncacheable-URL predictor, or nil.
+func (h *MultiTenantCDN) Predictor() *cache.Predictor { return h.predictor }
 
 // UpdateConfig replaces the routing configuration atomically.
 func (h *MultiTenantCDN) UpdateConfig(cfg *tenant.EdgeConfig) {
@@ -124,6 +142,13 @@ func (h *MultiTenantCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Predictor fast-path: skip cache lookup for URLs repeatedly observed
+	// to be uncacheable.
+	if h.predictor != nil && h.predictor.IsLikelyUncacheable(primaryKey) {
+		h.mtFetchAndServe(w, r, domain, primaryKey, rules)
+		return
+	}
+
 	if hasCacheDirective(r.Header.Get("Cache-Control"), "no-cache") {
 		h.mtFetchAndServe(w, r, domain, primaryKey, rules)
 		return
@@ -131,7 +156,7 @@ func (h *MultiTenantCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	entry := h.cache.Get(primaryKey)
 	if entry != nil {
-		if vary := entry.Header.Get("Vary"); vary != "" && vary != "*" {
+		if vary := entry.GetHeader().Get("Vary"); vary != "" && vary != "*" {
 			varyKey := cache.NormalizeKey(hostname, r.URL.Path, r.URL.RawQuery, vary, r.Header)
 			if varyKey != primaryKey {
 				entry = h.cache.Get(varyKey)
@@ -208,6 +233,12 @@ func (h *MultiTenantCDN) mtFetchAndServe(w http.ResponseWriter, r *http.Request,
 		serveEntry(w, entry, "MISS")
 		return
 	}
+
+	// Teach the predictor so subsequent requests bypass the cache lookup.
+	if h.predictor != nil {
+		h.predictor.MarkUncacheable(primaryKey)
+	}
+
 	serveResponse(w, resp, "BYPASS")
 }
 

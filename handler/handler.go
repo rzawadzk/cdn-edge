@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strconv"
@@ -19,17 +20,40 @@ import (
 
 // CDN is the main HTTP handler that serves cached content or fetches from origin.
 type CDN struct {
-	cache    *cache.Cache
-	origin   *proxy.Origin
-	cfg      *config.Config
-	log      *logging.Logger
-	stampede *cache.StampedeLock
+	cache     *cache.Cache
+	origin    *proxy.Origin
+	cfg       *config.Config
+	log       *logging.Logger
+	stampede  *cache.StampedeLock
+	predictor *cache.Predictor // nil when disabled
 }
 
 // New creates a CDN handler.
 func New(c *cache.Cache, o *proxy.Origin, cfg *config.Config, log *logging.Logger) *CDN {
-	return &CDN{cache: c, origin: o, cfg: cfg, log: log, stampede: cache.NewStampedeLock()}
+	h := &CDN{
+		cache:    c,
+		origin:   o,
+		cfg:      cfg,
+		log:      log,
+		stampede: cache.NewStampedeLock(),
+	}
+	if cfg.PredictorEnabled {
+		h.predictor = cache.NewPredictor(cfg.PredictorCapacity, cfg.PredictorDecay)
+	}
+	return h
 }
+
+// Start launches background workers for the handler (currently: predictor
+// decay). Call once at startup with a context that cancels on shutdown.
+func (h *CDN) Start(ctx context.Context) {
+	if h.predictor != nil {
+		go h.predictor.StartDecay(ctx)
+	}
+}
+
+// Predictor returns the handler's uncacheable-URL predictor, or nil if
+// the feature is disabled. Exposed for tests and metrics.
+func (h *CDN) Predictor() *cache.Predictor { return h.predictor }
 
 func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -58,6 +82,14 @@ func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Build primary cache key (Vary-unaware for initial lookup).
 	primaryKey := cache.NormalizeKey(r.Host, r.URL.Path, r.URL.RawQuery, "", nil)
 
+	// Predictor fast-path: if we've seen this URL be uncacheable enough
+	// times recently, skip the cache entirely and go straight to origin.
+	// This saves the cache lock + hash on hot API paths like /health, /api.
+	if h.predictor != nil && h.predictor.IsLikelyUncacheable(primaryKey) {
+		h.fetchAndServe(w, r, primaryKey)
+		return
+	}
+
 	// Check if the client explicitly bypasses cache.
 	if hasCacheDirective(r.Header.Get("Cache-Control"), "no-cache") {
 		h.fetchAndServe(w, r, primaryKey)
@@ -69,7 +101,7 @@ func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// If the cached entry has a Vary header, re-key with request headers.
 	if entry != nil {
-		if vary := entry.Header.Get("Vary"); vary != "" {
+		if vary := entry.GetHeader().Get("Vary"); vary != "" {
 			if vary == "*" {
 				// Vary: * means never serve from cache.
 				h.fetchAndServe(w, r, primaryKey)
@@ -124,8 +156,15 @@ func (h *CDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *CDN) fetchAndServe(w http.ResponseWriter, r *http.Request, primaryKey string) {
 	// Stampede lock: if another goroutine is already fetching this key, wait
-	// for its result instead of hitting origin again.
-	if entry, waited := h.stampede.Acquire(primaryKey); waited {
+	// for its result instead of hitting origin again. Use the streaming-aware
+	// variant so waiters can start reading bytes before the full download.
+	entry, se, waited := h.stampede.AcquireStreaming(primaryKey)
+	if waited {
+		if se != nil {
+			// Stream bytes to the client as they arrive from the origin.
+			serveStreamingEntry(w, se, "HIT")
+			return
+		}
 		if entry != nil {
 			serveEntry(w, entry, "HIT")
 		} else {
@@ -138,23 +177,22 @@ func (h *CDN) fetchAndServe(w http.ResponseWriter, r *http.Request, primaryKey s
 		}
 		return
 	}
-	// We are the fetcher — perform the origin request and release the lock.
-	defer func() {
-		// Release is called with the cached entry (or nil on failure) so
-		// waiting goroutines can use it.
-		if entry := h.cache.Get(primaryKey); entry != nil {
-			h.stampede.Release(primaryKey, entry, nil)
-		} else {
-			h.stampede.Release(primaryKey, nil, fmt.Errorf("not cached"))
-		}
-	}()
 
+	// We are the fetcher — perform the origin request with streaming.
+	h.fetchAndServeStreaming(w, r, primaryKey)
+}
+
+// fetchAndServeStreaming performs the origin fetch, streaming bytes to both the
+// client and any waiting goroutines via a StreamingEntry.
+func (h *CDN) fetchAndServeStreaming(w http.ResponseWriter, r *http.Request, primaryKey string) {
 	originURL := h.cfg.OriginURL + r.URL.RequestURI()
 
 	resp, err := h.origin.Fetch(r.Context(), primaryKey, originURL, r.Header)
 	if err != nil {
 		reqID := logging.GetRequestID(r.Context())
 		h.log.Error("origin fetch failed", err, reqID)
+
+		h.stampede.Release(primaryKey, nil, err)
 
 		// If circuit is open and we have stale data, serve it.
 		if stale := h.cache.Get(primaryKey); stale != nil {
@@ -169,6 +207,24 @@ func (h *CDN) fetchAndServe(w http.ResponseWriter, r *http.Request, primaryKey s
 	ttl, swr := h.determineTTL(resp)
 
 	if ttl > 0 && isCacheableStatus(resp.StatusCode) {
+		// Publish a streaming entry so waiters can start reading immediately.
+		se := cache.NewStreamingEntry(resp.Header.Clone(), resp.StatusCode)
+		h.stampede.SetStreaming(primaryKey, se)
+
+		// Write the body into the streaming entry. origin.Fetch already read
+		// the full body into memory, so chunk it to give readers a chance to
+		// make progress while we're still writing.
+		body := resp.Body
+		const chunkSize = 32 * 1024
+		for off := 0; off < len(body); off += chunkSize {
+			end := off + chunkSize
+			if end > len(body) {
+				end = len(body)
+			}
+			se.Write(body[off:end])
+		}
+		se.Close(nil)
+
 		etag := resp.Header.Get("ETag")
 		if etag == "" {
 			hash := sha256.Sum256(resp.Body)
@@ -179,30 +235,63 @@ func (h *CDN) fetchAndServe(w http.ResponseWriter, r *http.Request, primaryKey s
 		vary := resp.Header.Get("Vary")
 		cacheKey := cache.NormalizeKey(r.Host, r.URL.Path, r.URL.RawQuery, vary, r.Header)
 
-		entry := &cache.Entry{
-			Body:                 resp.Body,
-			Header:               resp.Header.Clone(),
-			StatusCode:           resp.StatusCode,
-			StoredAt:             time.Now(),
-			TTL:                  ttl,
-			ETag:                 etag,
-			LastMod:              resp.Header.Get("Last-Modified"),
-			VaryKey:              cacheKey,
-			StaleWhileRevalidate: swr,
-		}
+		cacheEntry := se.ToEntry(ttl, swr, etag, resp.Header.Get("Last-Modified"), cacheKey)
 
 		// Store under both primary key (for initial lookup) and vary key.
-		h.cache.Put(primaryKey, entry)
+		h.cache.Put(primaryKey, cacheEntry)
 		if cacheKey != primaryKey {
-			h.cache.Put(cacheKey, entry)
+			h.cache.Put(cacheKey, cacheEntry)
 		}
 
-		serveEntry(w, entry, "MISS")
+		h.stampede.Release(primaryKey, cacheEntry, nil)
+
+		serveEntry(w, cacheEntry, "MISS")
 		return
 	}
 
-	// Not cacheable — pass through.
+	// Not cacheable — release stampede lock and pass through.
+	h.stampede.Release(primaryKey, nil, fmt.Errorf("not cacheable"))
+
+	// Record in the predictor so future requests can skip the cache lookup.
+	if h.predictor != nil {
+		h.predictor.MarkUncacheable(primaryKey)
+	}
+
 	serveResponse(w, resp, "BYPASS")
+}
+
+// serveStreamingEntry streams bytes from a StreamingEntry to the client as they
+// arrive. It writes headers immediately and flushes chunks as they become
+// available.
+func serveStreamingEntry(w http.ResponseWriter, se *cache.StreamingEntry, cacheStatus string) {
+	for k, vals := range se.Header() {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("X-Cache", cacheStatus)
+	w.WriteHeader(se.StatusCode())
+
+	reader := se.NewReader(0)
+	flusher, canFlush := w.(http.Flusher)
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				// Origin failed mid-stream; headers are already sent so we
+				// can only terminate the response.
+			}
+			break
+		}
+	}
 }
 
 func (h *CDN) revalidateAsync(host, requestURI, urlPath, rawQuery string, reqHeader http.Header, primaryKey, reqID string) {
@@ -303,8 +392,9 @@ var ageBufPool = sync.Pool{
 func serveEntry(w http.ResponseWriter, entry *cache.Entry, cacheStatus string) {
 	h := w.Header()
 	// Copy headers directly into the map to avoid textproto canonicalization overhead.
-	// Entry headers already have canonical keys from net/http.
-	for k, vals := range entry.Header {
+	// Entry headers already have canonical keys from net/http. GetHeader()
+	// decodes the compressed form on demand when compression is enabled.
+	for k, vals := range entry.GetHeader() {
 		h[k] = vals
 	}
 	h["X-Cache"] = cacheStatusSlice(cacheStatus)

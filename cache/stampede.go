@@ -18,10 +18,12 @@ type StampedeLock struct {
 }
 
 type lockEntry struct {
-	done    chan struct{}
-	entry   *Entry
-	err     error
-	waiters int32
+	done        chan struct{}
+	streamReady chan struct{} // closed when streaming entry is available
+	entry       *Entry
+	streaming   *StreamingEntry
+	err         error
+	waiters     int32
 }
 
 // NewStampedeLock creates a new StampedeLock.
@@ -52,7 +54,8 @@ func (sl *StampedeLock) Acquire(key string) (*Entry, bool) {
 
 	// First requester — create a lock entry.
 	le = &lockEntry{
-		done: make(chan struct{}),
+		done:        make(chan struct{}),
+		streamReady: make(chan struct{}),
 	}
 	sl.locks[key] = le
 	sl.mu.Unlock()
@@ -73,6 +76,63 @@ func (sl *StampedeLock) Release(key string, entry *Entry, err error) {
 	delete(sl.locks, key)
 	sl.mu.Unlock()
 	close(le.done)
+}
+
+// SetStreaming publishes a StreamingEntry so that waiters can start
+// reading bytes before the full response is downloaded. Must be called
+// by the fetcher goroutine (the one that got waited=false from Acquire)
+// before Release. Waiters using AcquireStreaming will receive this entry.
+func (sl *StampedeLock) SetStreaming(key string, se *StreamingEntry) {
+	sl.mu.Lock()
+	le, ok := sl.locks[key]
+	sl.mu.Unlock()
+	if !ok {
+		return
+	}
+	le.streaming = se
+	close(le.streamReady)
+}
+
+// AcquireStreaming is like Acquire but returns a *StreamingEntry if the
+// fetcher has called SetStreaming. The returned streaming entry may be
+// non-nil even if *Entry is nil (streaming is still in progress).
+//
+// Return values:
+//   - (nil, nil, false) — this goroutine is the fetcher; perform the fetch.
+//   - (entry, nil, true) — waited; fetch completed with a full entry (or nil+error).
+//   - (nil, streamingEntry, true) — waited; streaming entry available for progressive reading.
+func (sl *StampedeLock) AcquireStreaming(key string) (*Entry, *StreamingEntry, bool) {
+	sl.mu.Lock()
+	le, exists := sl.locks[key]
+	if exists {
+		atomic.AddInt32(&le.waiters, 1)
+		sl.mu.Unlock()
+
+		// Wait for either the streaming entry or full completion.
+		select {
+		case <-le.streamReady:
+			// Streaming entry is available — return it immediately.
+			return nil, le.streaming, true
+		case <-le.done:
+			// Completed before streaming was set, or streaming was set and done.
+			if le.err != nil {
+				return nil, nil, true
+			}
+			if le.streaming != nil {
+				return nil, le.streaming, true
+			}
+			return le.entry, nil, true
+		}
+	}
+
+	// First requester.
+	le = &lockEntry{
+		done:        make(chan struct{}),
+		streamReady: make(chan struct{}),
+	}
+	sl.locks[key] = le
+	sl.mu.Unlock()
+	return nil, nil, false
 }
 
 // Waiters returns the number of goroutines waiting on a key (for testing).
